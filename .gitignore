@@ -1,5 +1,4 @@
 .env
-LR_Baseline.ipynb
 
 __pycache__/
 *.py[cod]

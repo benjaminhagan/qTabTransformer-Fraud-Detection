@@ -474,12 +474,12 @@ def train_model(
             best_val_auprc = val_metrics["auprc"]
             best_state = copy.deepcopy(model.state_dict())
 
-        print(
-            f"Epoch {epoch:02d} | "
-            f"train_loss={train_loss:.5f} | "
-            f"val_auprc={val_metrics['auprc']:.5f} | "
-            f"val_auroc={val_metrics['auroc']:.5f}"
-        )
+        # print(
+        #     f"Epoch {epoch:02d} | "
+        #     f"train_loss={train_loss:.5f} | "
+        #     f"val_auprc={val_metrics['auprc']:.5f} | "
+        #     f"val_auroc={val_metrics['auroc']:.5f}"
+        # )
 
         auprcs.append(val_metrics['auprc'])
         aurocs.append(val_metrics['auroc'])
