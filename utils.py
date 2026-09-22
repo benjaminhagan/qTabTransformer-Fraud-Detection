@@ -1,5 +1,9 @@
 import numpy as np
 import pandas as pd
+import torch
+from qCLSTabTransformer import CLSQuantumTabTransformerBinaryClassifier
+from TabTransformer import TabTransformerBinaryClassifier
+from dataclasses import dataclass
 
 AMEX_CATEGORICAL_COLS = [
     "B_30", "B_38",
@@ -96,3 +100,48 @@ def preprocess_amex(train_data: pd.DataFrame, train_labels: pd.DataFrame) -> pd.
     df["Class"] = df["Class"].astype(np.float32)
 
     return df
+
+@dataclass(eq=False)
+class Standardizer:
+    mean: np.ndarray
+    std: np.ndarray
+
+    @classmethod
+    def fit(cls, X: np.ndarray):
+        mean = X.mean(axis=0)
+        std = X.std(axis=0)
+        std = np.where(std < 1e-8, 1.0, std)
+        return cls(mean=mean, std=std)
+
+    def transform(self, X: np.ndarray):
+        return (X - self.mean) / self.std
+    
+
+
+def checkpoint_from_model(model: CLSQuantumTabTransformerBinaryClassifier) -> dict:
+    checkpoint = {
+        "model_config": model.config,
+        "model_state_dict": model.state_dict(),
+        "threshold": float(model.threshold),
+        "feature_cols": list(model.feature_cols),
+        "scaler_mean": torch.as_tensor(model.scaler.mean, dtype=torch.float32),
+        "scaler_std": torch.as_tensor(model.scaler.std, dtype=torch.float32),
+    }
+    return checkpoint
+
+
+def model_from_checkpoint(checkpoint: dict) -> CLSQuantumTabTransformerBinaryClassifier:
+    is_quantum = "qufex_params" in checkpoint["model_config"]
+
+    model = CLSQuantumTabTransformerBinaryClassifier(**checkpoint["model_config"]) if is_quantum else TabTransformerBinaryClassifier(**checkpoint["model_config"])
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.threshold = checkpoint["threshold"]
+    model.feature_cols = checkpoint["feature_cols"]
+    model.scaler = Standardizer(mean=checkpoint["scaler_mean"].numpy(), std=checkpoint["scaler_std"].numpy())
+
+    if not is_quantum:
+        model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+    model.eval()
+
+    return model
