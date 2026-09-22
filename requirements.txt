@@ -11,4 +11,6 @@ numpy
 matplotlib
 scikit-learn
 pennylane==0.45.0
+pennylane-qiskit==0.45.0
 qiskit==2.3.0
+qiskit-ibm-runtime==0.45.1
