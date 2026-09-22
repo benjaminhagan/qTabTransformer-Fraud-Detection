@@ -2,7 +2,6 @@ import math
 import time
 import copy
 import random
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -12,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset, WeightedRandomS
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve
+from utils import Standardizer
 
 dev_name = "cuda" if torch.cuda.is_available() else "cpu"
 #dev_name = "cpu"
@@ -42,22 +42,6 @@ class TabularDataset(Dataset):
         if self.y is None:
             return self.X[idx]
         return self.X[idx], self.y[idx]
-
-
-@dataclass
-class Standardizer:
-    mean: np.ndarray
-    std: np.ndarray
-
-    @classmethod
-    def fit(cls, X: np.ndarray):
-        mean = X.mean(axis=0)
-        std = X.std(axis=0)
-        std = np.where(std < 1e-8, 1.0, std)
-        return cls(mean=mean, std=std)
-
-    def transform(self, X: np.ndarray):
-        return (X - self.mean) / self.std
 
 
 def make_dataloaders(
@@ -418,19 +402,31 @@ def run_experiment(df: pd.DataFrame, lr=3e-3, target_col="Class"):
     #     d_token=32,
     #     n_heads=4,
     #     n_layers=2,
-    #     d_ff=128,
+    #     d_ff=64,
     #     dropout=0.1,
     # )
 
-    model = TabTransformerBinaryClassifier(
-        n_features=n_features,
-        d_token=32,
-        n_heads=4,
-        n_layers=2,
-        d_ff=16,
-        dropout=0.1,
-    )
+    model_config_medium = {
+        "n_features": len(data["feature_cols"]),
+        "d_token": 32,
+        "n_heads": 4,
+        "n_layers": 2,
+        "d_ff": 64,
+        "dropout": 0.1,
+    }
 
+    model = TabTransformerBinaryClassifier(**model_config_medium)
+
+    # model = TabTransformerBinaryClassifier(
+    #     n_features=n_features,
+    #     d_token=32,
+    #     n_heads=4,
+    #     n_layers=2,
+    #     d_ff=16,
+    #     dropout=0.1,
+    # )
+
+    model.config = model_config_medium
     model.scaler = data["scaler"]
     model.feature_cols = data["feature_cols"]
 
