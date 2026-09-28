@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qtabtransformer-fraud-detection"
+version = "0.1.0"
+description = "TabTransformer and quantum-enhanced TabTransformer models for fraud detection"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["models*", "utils*"]

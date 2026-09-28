@@ -8,3 +8,13 @@ Classical Implementation: Uses GPU accelerated PyTorch interface to establish ba
 Quantum CLS Implementation: Adds one QuFeX layer after the self-attention layers on only the CLS token.
 
 Quantum MLP Implementation: Adds QuFeX layer on every token in MLP layers in between attention layers.
+
+## Installation
+
+Clone the repository and install the required dependencies:
+
+```bash
+git clone https://github.com/benjaminhagan/qTabTransformer-Fraud-Detection
+cd qTabTransformer-Fraud-Detection
+pip install -r requirements.txt
+pip install -e .

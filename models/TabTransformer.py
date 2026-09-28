@@ -1,18 +1,20 @@
-import copy
 import math
+import time
+import copy
 import random
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, TensorDataset, WeightedRandomSampler
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve
-from utils import Standardizer
-import pennylane as qml
+from utils.Preprocessor import Standardizer
 
-#dev_name = "cuda" if torch.cuda.is_available() else "cpu"
-dev_name = "cpu"
+dev_name = "cuda" if torch.cuda.is_available() else "cpu"
+#dev_name = "cpu"
 PIN_MEMORY = dev_name == "cuda" #Pins memory only for GPU acceleration
 
 # -------------------------
@@ -26,7 +28,7 @@ def seed_everything(seed: int = 42):
 
 
 # -------------------------
-# Data
+# Data utilities
 # -------------------------
 class TabularDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray | None = None):
@@ -47,12 +49,16 @@ def make_dataloaders(
     target_col: str = "Class",
     test_size: float = 0.2,
     val_size: float = 0.1,
-    batch_size: int = 512,
+    batch_size: int = 2048,
     num_workers: int = 0,
     use_weighted_sampler: bool = True,
-    seed: int = 42,
+    seed: int = 42
 ):
-    
+    """
+    Splits df into train/val/test, standardizes features using train stats only,
+    and returns dataloaders plus metadata.
+    """
+
     seed_everything(seed)
     feature_cols = [c for c in df.columns if c != target_col]
     X = df[feature_cols].to_numpy(dtype=np.float32)
@@ -72,6 +78,7 @@ def make_dataloaders(
 
     test_df = df.iloc[idx_test].copy()
 
+    # Standardize using train only
     scaler = Standardizer.fit(X_train)
     X_train = scaler.transform(X_train).astype(np.float32)
     X_val = scaler.transform(X_val).astype(np.float32)
@@ -82,6 +89,7 @@ def make_dataloaders(
     test_ds = TabularDataset(X_test, y_test)
 
     if use_weighted_sampler:
+        # Helpful for extreme class imbalance
         class_counts = np.bincount(y_train.astype(int))
         class_counts = np.maximum(class_counts, 1)
         class_weights = 1.0 / class_counts
@@ -92,26 +100,21 @@ def make_dataloaders(
             replacement=True,
         )
         train_loader = DataLoader(
-            train_ds,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=PIN_MEMORY,
+            train_ds, batch_size=batch_size, sampler=sampler,
+            num_workers=num_workers, pin_memory=PIN_MEMORY
         )
     else:
         train_loader = DataLoader(
-            train_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=PIN_MEMORY,
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=PIN_MEMORY
         )
-
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=PIN_MEMORY
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=PIN_MEMORY
     )
     test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=PIN_MEMORY
+        test_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=PIN_MEMORY
     )
 
     pos = float((y_train == 1).sum())
@@ -130,9 +133,13 @@ def make_dataloaders(
 
 
 # -------------------------
-# Tokenizer
+# Model
 # -------------------------
 class NumericalTokenizer(nn.Module):
+    """
+    Turns each scalar feature into a d_token embedding.
+
+    """
     def __init__(self, n_features: int, d_token: int):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(n_features, d_token) * 0.02)
@@ -143,234 +150,17 @@ class NumericalTokenizer(nn.Module):
         return x * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
 
 
-# -------------------------
-# Quantum circuit
-# -------------------------
-def build_pqc_vit0(n_qubits: int, quantum_device, shots: int):
-    using_qpu = quantum_device is not None
-    dev = quantum_device
-
-    if dev is None:
-        dev = qml.device("lightning.qubit", wires=n_qubits)
-
-    diff_method = None if using_qpu else "adjoint"
-
-    @qml.qnode(dev, interface="torch", diff_method=diff_method)
-    def circuit(inputs, weight_0, weight_1):
-        qml.AngleEmbedding(np.pi * inputs, wires=range(n_qubits), rotation="Y")
-
-        indices = n_qubits // 2
-
-        # U1
-        for i in range(indices):
-            qml.RX(weight_0[0], wires=2 * i)
-            qml.RZ(weight_0[1], wires=2 * i + 1)
-            qml.CNOT(wires=[2 * i, 2 * i + 1])
-
-        for i in range(1, indices):
-            qml.RX(weight_0[0], wires=2 * i - 1)
-            qml.RZ(weight_0[1], wires=2 * i)
-            qml.CNOT(wires=[2 * i - 1, 2 * i])
-
-        # V1
-        for i in range(indices):
-            qml.CZ(wires=[2 * i, 2 * i + 1])
-
-        indices = indices // 2
-
-        # U2
-        for i in range(indices):
-            qml.RX(weight_1[0], wires=2 * (2 * i))
-            qml.RY(weight_1[1], wires=2 * (2 * i + 1))
-            qml.CNOT(wires=[2 * (2 * i), 2 * (2 * i + 1)])
-
-        for i in range(1, indices):
-            qml.RX(weight_1[0], wires=2 * (2 * i - 1))
-            qml.RY(weight_1[1], wires=2 * (2 * i))
-            qml.CNOT(wires=[2 * (2 * i - 1), 2 * (2 * i)])
-
-        # V2
-        for i in range(indices):
-            qml.CZ(wires=[2 * (2 * i), 2 * (2 * i + 1)])
-
-        return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-
-    if using_qpu:
-        circuit = qml.set_shots(circuit, shots)
-
-    return circuit
-
-
-def build_pqc_vit1(n_qubits: int, quantum_device, shots: int):
-    using_qpu = quantum_device is not None
-    dev = quantum_device
-
-    if dev is None:
-        dev = qml.device("lightning.qubit", wires=n_qubits)
-
-    diff_method = None if using_qpu else "adjoint"
-
-    @qml.qnode(dev, interface="torch", diff_method=diff_method)
-    def circuit(inputs, weight_0, weight_1):
-        qml.AngleEmbedding(np.pi * inputs, wires=range(n_qubits), rotation="Z")
-
-        indices = n_qubits // 2
-
-        # U1
-        for i in range(indices):
-            qml.RY(weight_0[0], wires=2*i)
-            qml.RX(weight_0[1], wires=2*i+1)
-            qml.CNOT(wires=[2*i, 2*i+1])
-        
-        for i in range(1, indices):
-            qml.RY(weight_0[0], wires=2*i - 1)
-            qml.RX(weight_0[1], wires=2*i)
-            qml.CNOT(wires=[2*i - 1, 2*i])
-
-        # V1
-        for i in range(indices):
-            qml.CZ(wires=[2*i, 2*i+1])
-
-        indices = int(indices/2)
-
-        # U2
-        for i in range(indices):
-            qml.RZ(weight_1[0], wires=2*(2*i))
-            qml.RX(weight_1[1], wires=2*(2*i+1))
-            qml.CNOT(wires=[2*(2*i), 2*(2*i+1)])
-        
-        for i in range(1, indices):
-            qml.RZ(weight_1[0], wires=2*(2*i - 1))
-            qml.RX(weight_1[1], wires=2*(2*i))
-            qml.CNOT(wires=[2*(2*i - 1), 2*(2*i)])
-        
-        # V2
-        for i in range(indices):
-            qml.CZ(wires=[2*(2*i), 2*(2*i+1)])
-
-        return [qml.expval(qml.PauliX(wires=i)) for i in range(n_qubits)]
-
-    if using_qpu and shots is not None:
-        circuit = qml.set_shots(circuit, shots)
-
-    return circuit
-
-
-class QuantumCLSBlock(nn.Module):
-    """
-    Applies the quantum circuit only to the CLS token embedding.
-
-    """
-    def __init__(
-        self,
-        quantum_device,
-        shots: int,
-        d_model: int,
-        quantum_dim: int = 8,
-        n_qubits: int = 4,
-        n_filters: int = 1,
-        dropout_rate: float = 0.1,
-    ):
-        super().__init__()
-        assert quantum_dim % n_qubits == 0, "quantum_dim must be divisible by n_qubits"
-        assert n_filters == 1 or n_filters == 2, "functionality only provided for 1 or 2 quantum filters"
-
-        self.d_model = d_model
-        self.quantum_dim = quantum_dim
-        self.n_qubits = n_qubits
-        self.n_filters = n_filters
-        self.n_chunks = quantum_dim // n_qubits
-
-        self.compress = nn.Linear(d_model, quantum_dim)
-        self.expand = nn.Linear(quantum_dim * n_filters, d_model)
-        self.pre_act = nn.GELU()
-        self.dropout = nn.Dropout(dropout_rate)
-
-        self.weight_0 = nn.Parameter(0.01 * torch.randn(n_filters, 2))
-        self.weight_1 = nn.Parameter(0.01 * torch.randn(n_filters, 2))
-
-        self.configure_quantum_execution(quantum_device, shots)
-
-    def configure_quantum_execution(self, quantum_device, shots: int):
-        self.circuit0 = build_pqc_vit0(self.n_qubits, quantum_device, shots)
-        self.circuit1 = build_pqc_vit1(self.n_qubits, quantum_device, shots)
-
-    def _run_quantum_chunk(self, chunk_2d: torch.Tensor, weight_0: torch.Tensor, weight_1: torch.Tensor, filter_idx: int) -> torch.Tensor:
-        outs = []
-        for sample in chunk_2d:
-            if filter_idx == 0:
-                out = self.circuit0(sample, weight_0, weight_1)
-            else:
-                out = self.circuit1(sample, weight_0, weight_1)
-
-            if isinstance(out, (list, tuple)):
-                out = torch.stack(
-                    [o if torch.is_tensor(o) else torch.tensor(o, device=sample.device, dtype=sample.dtype)
-                     for o in out]
-                )
-
-            out = out.to(device=sample.device, dtype=sample.dtype)
-            outs.append(out)
-
-        return torch.stack(outs, dim=0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.compress(x)  
-        x = self.pre_act(x)
-        x = self.dropout(x)
-
-        chunks = torch.chunk(x, chunks=self.n_chunks, dim=-1)
-
-        filter_outputs = []
-
-        # Each filter processes every mixing channel.
-        for filter_idx in range(self.n_filters):
-            channel_outputs = []
-
-            for chunk in chunks:
-                out = self._run_quantum_chunk(
-                    chunk,
-                    self.weight_0[filter_idx],
-                    self.weight_1[filter_idx],
-                    filter_idx,
-                )
-                channel_outputs.append(out)
-
-            # Join the mixing-channel outputs for this filter.
-            filter_output = torch.cat(channel_outputs, dim=-1)
-            filter_outputs.append(filter_output)
-
-        # Join outputs from all independent filters.
-        x = torch.cat(filter_outputs, dim=-1)
-
-        x = self.dropout(x)
-        x = self.expand(x)
-
-        return x
-
-
-# -------------------------
-# Model
-# -------------------------
-class CLSQuantumTabTransformerBinaryClassifier(nn.Module):
+class TabTransformerBinaryClassifier(nn.Module):
     def __init__(
         self,
         n_features: int,
         d_token: int = 64,
         n_heads: int = 8,
-        n_layers: int = 3,
+        n_layers: int = 4,
         d_ff: int = 256,
         dropout: float = 0.1,
-        qufex_params: tuple = (4,1,1),
-        quantum_device = None,
-        shots: int = 1024,
     ):
         super().__init__()
-        n_qubits = qufex_params[0]
-        quantum_dim = n_qubits * qufex_params[2]
-        n_filters = qufex_params[1]
-        self.quantum_device = quantum_device
-        self.shots = shots
 
         self.tokenizer = NumericalTokenizer(n_features=n_features, d_token=d_token)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_token))
@@ -386,16 +176,6 @@ class CLSQuantumTabTransformerBinaryClassifier(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers, enable_nested_tensor=False)
 
-        self.quantum_cls = QuantumCLSBlock(
-            quantum_device=quantum_device,
-            shots=shots,
-            d_model=d_token,
-            quantum_dim=quantum_dim,
-            n_qubits=n_qubits,
-            n_filters=n_filters,
-            dropout_rate=dropout,
-        )
-
         self.head = nn.Sequential(
             nn.LayerNorm(d_token),
             nn.Linear(d_token, d_token),
@@ -404,36 +184,19 @@ class CLSQuantumTabTransformerBinaryClassifier(nn.Module):
             nn.Linear(d_token, 1),
         )
 
+        self._init_parameters()
+
+    def _init_parameters(self):
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
-    def configure_quantum_execution(self, quantum_device, shots: int):
-        self.quantum_device = quantum_device
-        self.shots = shots
-        self.quantum_cls.configure_quantum_execution(
-            quantum_device=quantum_device,
-            shots=shots,
-        )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        tokens = self.tokenizer(x)     
-        cls = self.cls_token.expand(x.size(0), -1, -1)  
-        z = torch.cat([cls, tokens], dim=1)    
-
-        z = self.encoder(z)                                 # classical attention blocks
-        cls_out = z[:, 0]                                   
-
-        cls_quantum = self.quantum_cls(cls_out)                 # quantum only 
-
-        cls_out = cls_out + cls_quantum     #With residual connections
-        #cls_out = cls_quantum               #Without residual connections
-
-        logits = self.head(cls_out).squeeze(-1)            
+        tokens = self.tokenizer(x)
+        cls = self.cls_token.expand(x.size(0), -1, -1) 
+        z = torch.cat([cls, tokens], dim=1) 
+        z = self.encoder(z)
+        logits = self.head(z[:, 0]).squeeze(-1)
         return logits
 
-
-# -------------------------
-# Metrics
-# -------------------------
 class FocalLoss(nn.Module):
     def __init__(self, alpha=1.0, gamma=2.0):
         super().__init__()
@@ -453,9 +216,8 @@ class FocalLoss(nn.Module):
         loss = self.alpha * ((1 - pt) ** self.gamma) * bce
         return loss.mean()
 
-
 # -------------------------
-# Train/Eval
+# Train / eval
 # -------------------------
 def train_model(
     model,
@@ -463,7 +225,7 @@ def train_model(
     val_loader,
     pos_weight,
     device,
-    lr: float = 3e-4,
+    lr: float = 1e-4,
     epochs: int = 20,
     weight_decay: float = 1e-5,
     grad_clip: float = 1.0,
@@ -478,6 +240,7 @@ def train_model(
 
     best_state = None
     best_val_auprc = -1.0
+    best_threshold = -1.0
 
     auprcs = []
     aurocs = []
@@ -487,17 +250,18 @@ def train_model(
         running_loss = 0.0
 
         for xb, yb in train_loader:
-
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
+            xb = xb.to(device)
+            yb = yb.to(device)
 
             optimizer.zero_grad(set_to_none=True)
             logits = model(xb)
             loss = criterion(logits, yb)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
 
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            optimizer.step()
             running_loss += loss.item() * xb.size(0)
 
         train_loss = running_loss / len(train_loader.dataset)
@@ -528,7 +292,6 @@ def train_model(
         #     f"val_auprc={val_metrics['auprc']:.5f} | "
         #     f"val_auroc={val_metrics['auroc']:.5f}"
         # )
-
         auprcs.append(val_metrics['auprc'])
         aurocs.append(val_metrics['auroc'])
 
@@ -538,6 +301,7 @@ def train_model(
 
     return model, auprcs, aurocs
 
+
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
@@ -545,8 +309,8 @@ def evaluate(model, loader, device):
     all_targets = []
 
     for xb, yb in loader:
-        xb = xb.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
+        xb = xb.to(device)
+        yb = yb.to(device)
 
         logits = model(xb)
         probs = torch.sigmoid(logits)
@@ -565,15 +329,13 @@ def evaluate(model, loader, device):
 
     return {"auprc": auprc, "auroc": auroc, "probs": probs, "targets": targets}
 
+
 @torch.no_grad()
-def infer_tabtransformer(model: torch.nn.Module, df: pd.DataFrame, quantum_device = None, shots: int = 1024, target_col: str = "Class", seed: int = 42):
+def infer_tabtransformer(model: torch.nn.Module, df: pd.DataFrame, target_col: str = "Class", seed: int = 42):
 
     model.eval()
     device = torch.device(dev_name)
     seed_everything(seed)
-
-    if model.quantum_device != quantum_device or model.shots != shots:
-        model.configure_quantum_execution(quantum_device, shots)
 
     X = df[model.feature_cols].to_numpy(dtype=np.float32)
     targets = df[target_col].to_numpy(dtype=np.float32)
@@ -583,7 +345,7 @@ def infer_tabtransformer(model: torch.nn.Module, df: pd.DataFrame, quantum_devic
 
     loader = DataLoader(
         X,
-        batch_size=1,
+        batch_size=8192,
         shuffle=False,
         pin_memory=PIN_MEMORY,
     )
@@ -608,27 +370,40 @@ def infer_tabtransformer(model: torch.nn.Module, df: pd.DataFrame, quantum_devic
 
     return  {"auprc": auprc, "auroc": auroc, "probs": probs, "preds": preds, "targets": targets}
 
-def run_experiment(df: pd.DataFrame, lr=3e-4, qufex_params=(4,1,1)):
+# -------------------------
+# Full ML workflow
+# -------------------------
+# df = Time, Amount, V1 ... V28, Class
+def run_experiment(df: pd.DataFrame, lr=3e-3, target_col="Class"):
     device = torch.device(dev_name)
 
     data = make_dataloaders(
         df,
-        target_col="Class",
+        target_col=target_col,
         test_size=0.2,
         val_size=0.1,
         batch_size=512,
         use_weighted_sampler=True,
-        seed=42,
+        seed=42
     )
 
-    # model = CLSQuantumTabTransformerBinaryClassifier(
-    #     n_features=len(data["feature_cols"]),
+    n_features = len(data["feature_cols"])
+    # model = TabTransformerBinaryClassifier(
+    #     n_features=n_features,
     #     d_token=64,
     #     n_heads=8,
-    #     n_layers=3,
+    #     n_layers=4,
     #     d_ff=256,
     #     dropout=0.1,
-    #     qufex_params=qufex_params,
+    # )
+
+    # model = TabTransformerBinaryClassifier(
+    #     n_features=n_features,
+    #     d_token=32,
+    #     n_heads=4,
+    #     n_layers=2,
+    #     d_ff=64,
+    #     dropout=0.1,
     # )
 
     model_config_medium = {
@@ -638,33 +413,33 @@ def run_experiment(df: pd.DataFrame, lr=3e-4, qufex_params=(4,1,1)):
         "n_layers": 2,
         "d_ff": 64,
         "dropout": 0.1,
-        "qufex_params": qufex_params,
     }
 
-    model = CLSQuantumTabTransformerBinaryClassifier(**model_config_medium)
+    model = TabTransformerBinaryClassifier(**model_config_medium)
 
-    # model = CLSQuantumTabTransformerBinaryClassifier(
-    #     n_features=len(data["feature_cols"]),
+    # model = TabTransformerBinaryClassifier(
+    #     n_features=n_features,
     #     d_token=32,
     #     n_heads=4,
     #     n_layers=2,
     #     d_ff=16,
     #     dropout=0.1,
-    #     qufex_params=qufex_params,
     # )
 
     model.config = model_config_medium
     model.scaler = data["scaler"]
     model.feature_cols = data["feature_cols"]
-    
+
     model, auprcs, aurocs = train_model(
         model,
         data["train_loader"],
         data["val_loader"],
-        data["pos_weight"],
+        pos_weight=data["pos_weight"],
         device=device,
         lr=lr,
         epochs=20,
+        weight_decay=1e-5,
+        grad_clip=1.0,
     )
 
     test_metrics = evaluate(model, data["test_loader"], device)
